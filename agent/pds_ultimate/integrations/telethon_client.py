@@ -129,12 +129,12 @@ class TelethonClient:
         offset_days: int = 30,
     ) -> list[dict]:
         """
-        Получить сообщения из чата.
+        Получить последние сообщения из чата.
 
         Args:
             chat_identifier: username, phone, или ID чата
             limit: Максимальное количество сообщений
-            offset_days: За сколько дней брать
+            offset_days: За сколько дней брать (фильтр после получения)
 
         Returns:
             [{"text", "date", "from_id", "is_owner", "reply_to"}, ...]
@@ -144,26 +144,52 @@ class TelethonClient:
             return []
 
         try:
-            entity = await self._client.get_entity(chat_identifier)
+            # Resolve entity — try multiple methods
+            entity = await self._resolve_entity(chat_identifier)
+            if not entity:
+                logger.warning(f"Не удалось найти чат: {chat_identifier}")
+                return []
+
             me = await self._client.get_me()
 
-            offset_date = datetime.utcnow() - timedelta(days=offset_days)
-
+            # Get latest messages WITHOUT offset_date
+            # (offset_date in Telethon = messages OLDER than date, not newer)
             messages = await self._client.get_messages(
                 entity,
                 limit=limit,
-                offset_date=offset_date,
             )
+
+            # Filter by date range manually
+            cutoff = datetime.utcnow() - timedelta(days=offset_days)
+            cutoff = cutoff.replace(
+                tzinfo=messages[0].date.tzinfo) if messages and messages[0].date else cutoff
 
             result = []
             for msg in messages:
+                # Skip non-text
                 if not msg.text:
                     continue
+
+                # Filter by date
+                if msg.date and msg.date.replace(tzinfo=None) < cutoff.replace(tzinfo=None):
+                    continue
+
+                sender_name = ""
+                try:
+                    if msg.sender:
+                        sender_name = getattr(
+                            msg.sender, "first_name", "") or ""
+                        last = getattr(msg.sender, "last_name", "") or ""
+                        if last:
+                            sender_name = f"{sender_name} {last}"
+                except Exception:
+                    pass
 
                 result.append({
                     "text": msg.text,
                     "date": msg.date.isoformat() if msg.date else "",
                     "from_id": msg.sender_id,
+                    "from_name": sender_name,
                     "is_owner": msg.sender_id == me.id,
                     "reply_to": msg.reply_to_msg_id,
                     "chat": str(chat_identifier),
@@ -171,7 +197,7 @@ class TelethonClient:
 
             logger.info(
                 f"Telethon: получено {len(result)} сообщений "
-                f"из {chat_identifier}"
+                f"из {chat_identifier} (всего загружено {len(messages)})"
             )
             return result
 
@@ -181,6 +207,42 @@ class TelethonClient:
                 exc_info=True,
             )
             return []
+
+    async def _resolve_entity(self, identifier: str):
+        """
+        Умный поиск entity — пробует несколько методов.
+        username, phone, id, поиск по имени в диалогах.
+        """
+        if not identifier:
+            return None
+
+        # 1. Try direct resolve (username, phone, numeric id)
+        for variant in [identifier, f"@{identifier}" if not identifier.startswith("@") else identifier]:
+            try:
+                return await self._client.get_entity(variant)
+            except Exception:
+                continue
+
+        # 2. Try numeric ID
+        try:
+            num_id = int(identifier)
+            return await self._client.get_entity(num_id)
+        except (ValueError, Exception):
+            pass
+
+        # 3. Search in dialogs by name (fuzzy)
+        try:
+            search_lower = identifier.lower().replace("@", "")
+            async for dialog in self._client.iter_dialogs(limit=200):
+                name = (dialog.name or "").lower()
+                if search_lower in name or name in search_lower:
+                    logger.info(
+                        f"Telethon: найден диалог '{dialog.name}' для '{identifier}'")
+                    return dialog.entity
+        except Exception as e:
+            logger.warning(f"Telethon dialog search error: {e}")
+
+        return None
 
     async def get_my_messages(
         self,

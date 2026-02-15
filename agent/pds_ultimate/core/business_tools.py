@@ -1076,7 +1076,11 @@ async def tool_read_telegram_chat(
 
         lines = [f"💬 Чат с {username or chat_id} (последние {len(messages)}):"]
         for m in messages[:limit]:
-            who = "🔵 Я" if m.get("is_owner") else "⚪ Собеседник"
+            if m.get("is_owner"):
+                who = "🔵 Я"
+            else:
+                from_name = m.get("from_name") or "Собеседник"
+                who = f"⚪ {from_name}"
             date_str = m.get("date", "")[:16].replace("T", " ")
             text_preview = (m.get("text") or "")[:200]
             lines.append(f"  {who} [{date_str}]: {text_preview}")
