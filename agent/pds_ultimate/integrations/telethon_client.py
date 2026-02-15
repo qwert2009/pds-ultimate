@@ -47,23 +47,62 @@ class TelethonClient:
             return
 
         try:
+            import python_socks
             from telethon import TelegramClient
+
+            # Прокси для обхода блокировок
+            # Telethon использует MTProto (TCP) — нужен SOCKS5, НЕ HTTP
+            # HTTP прокси (порт 10809) не работает для MTProto
+            # SOCKS5 обычно на порту 10808 (V2Ray/Clash стандарт)
+            proxy = None
+            if config.telegram.proxy:
+                from urllib.parse import urlparse
+                parsed = urlparse(config.telegram.proxy)
+                host = parsed.hostname or "127.0.0.1"
+                # Переключаемся на SOCKS5 порт (10808 для V2Ray)
+                socks_port = (parsed.port or 10809) - 1  # 10809 → 10808
+                proxy = (
+                    python_socks.ProxyType.SOCKS5,
+                    host,
+                    socks_port,
+                )
+                logger.info(f"Telethon SOCKS5 proxy: {host}:{socks_port}")
 
             self._client = TelegramClient(
                 config.telethon.session_name,
                 config.telethon.api_id,
                 config.telethon.api_hash,
+                proxy=proxy,
             )
 
-            await self._client.start()
-            me = await self._client.get_me()
-            self._started = True
+            # Сначала пробуем connect — если сессия есть, код не нужен
+            await self._client.connect()
 
-            logger.info(
-                f"Telethon подключён как: "
-                f"{me.first_name} {me.last_name or ''} "
-                f"(@{me.username or 'N/A'})"
-            )
+            if await self._client.is_user_authorized():
+                me = await self._client.get_me()
+                self._started = True
+                logger.info(
+                    f"Telethon подключён (сессия): "
+                    f"{me.first_name} {me.last_name or ''} "
+                    f"(@{me.username or 'N/A'})"
+                )
+            else:
+                # Сессия не авторизована — нужен код
+                # start() с phone отправит код и запросит ввод
+                phone = config.telethon.phone or None
+                if phone:
+                    await self._client.start(phone=phone)
+                    me = await self._client.get_me()
+                    self._started = True
+                    logger.info(
+                        f"Telethon авторизован: "
+                        f"{me.first_name} {me.last_name or ''} "
+                        f"(@{me.username or 'N/A'})"
+                    )
+                else:
+                    logger.warning(
+                        "Telethon: сессия не авторизована и TG_PHONE не задан"
+                    )
 
         except Exception as e:
             logger.error(f"Ошибка запуска Telethon: {e}", exc_info=True)

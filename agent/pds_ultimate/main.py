@@ -51,6 +51,12 @@ async def main():
     engine, session_factory = init_database()
     logger.info("  ✅ БД готова")
 
+    from pds_ultimate.core.persona_engine import persona_engine
+    persona_engine.set_session_factory(session_factory)
+
+    from pds_ultimate.core.contact_book import contact_book
+    contact_book.set_session_factory(session_factory)
+
     # ─── 3. Запуск LLM Engine ────────────────────────────────────────────
     logger.info("[3/7] Запуск LLM Engine (DeepSeek API)...")
     from pds_ultimate.core.llm_engine import llm_engine
@@ -416,6 +422,10 @@ async def main():
         await gmail_client.stop()
         try:
             await browser_engine.stop()
+        except Exception:
+            pass
+        try:
+            persona_engine.save()
         except Exception:
             pass
         await llm_engine.stop()

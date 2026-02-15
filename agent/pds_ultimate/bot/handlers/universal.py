@@ -48,6 +48,7 @@ from pds_ultimate.core.database import (
     TransactionType,
 )
 from pds_ultimate.core.llm_engine import llm_engine
+from pds_ultimate.core.persona_engine import persona_engine
 from pds_ultimate.core.user_manager import user_manager
 
 router = Router(name="universal")
@@ -145,6 +146,21 @@ async def handle_text(message: Message, db_session: Session) -> None:
     ctx.add_user_message(text)
     _save_to_db(db_session, chat_id, "user", text)
 
+    # Persona learning per user
+    try:
+        profile = user_manager.get_profile(chat_id, db_session)
+        display_name = profile.get("name") if profile else ""
+        if not display_name:
+            display_name = getattr(message.from_user, "full_name", "") or ""
+        persona_engine.learn_from_message(
+            chat_id=chat_id,
+            text=text,
+            is_owner=chat_id == config.telegram.owner_id,
+            display_name=display_name,
+        )
+    except Exception as e:
+        logger.debug(f"Persona learn error: {e}")
+
     # Показываем "печатает..."
     await message.bot.send_chat_action(chat_id, "typing")
 
@@ -157,12 +173,31 @@ async def handle_text(message: Message, db_session: Session) -> None:
 
         # Отправляем ответ
         if response:
+            # Safety net: если LLM вернул сырой JSON — извлекаем ответ
+            response = _extract_answer_from_json(response)
+
             # Telegram ограничение: 4096 символов
             for chunk in _split_message(response):
                 await message.answer(chunk)
 
             ctx.add_assistant_message(response)
             _save_to_db(db_session, chat_id, "assistant", response)
+
+        # Отправляем файлы, если агент создал их
+        pending_files = getattr(ctx, '_pending_files', [])
+        if pending_files:
+            from aiogram.types import FSInputFile
+            for file_info in pending_files:
+                filepath = file_info.get("filepath", "")
+                filename = file_info.get("filename", "")
+                if filepath and os.path.exists(filepath):
+                    try:
+                        doc = FSInputFile(filepath, filename=filename)
+                        await message.answer_document(doc, caption=f"📎 {filename}")
+                    except Exception as fe:
+                        logger.error(f"Ошибка отправки файла: {fe}")
+                        await message.answer(f"❌ Не удалось отправить файл: {filename}")
+            ctx._pending_files = []
 
     except Exception as e:
         logger.error(f"Ошибка обработки сообщения: {e}", exc_info=True)
@@ -247,8 +282,7 @@ async def _handle_free(
     """
 
     # ─── Проверка кодового слова безопасности ────────────────────────
-    if config.security.emergency_code and text.strip() == config.security.emergency_code:
-        return await _security_emergency(db_session)
+    # (отключено по запросу пользователя)
 
     # ─── Проверка: пользователь отправил API-ключ? ───────────────────
     if _looks_like_api_key(text):
@@ -290,6 +324,7 @@ async def _handle_free(
 
     # ─── Smart Routing: нужны ли инструменты? ────────────────────────
     needs_tools = await agent.should_use_tools(text)
+    style_guide = persona_engine.get_style_guide(ctx.chat_id)
 
     if needs_tools:
         # ─── ReAct Agent Loop ────────────────────────────────────────
@@ -300,6 +335,7 @@ async def _handle_free(
             chat_id=ctx.chat_id,
             history=ctx.get_history_for_llm(),
             db_session=db_session,
+            style_guide=style_guide,
         )
 
         # Логируем мышление агента
@@ -335,6 +371,10 @@ async def _handle_free(
         except Exception:
             pass
 
+        # Если агент создал файлы — сохраняем для отправки
+        if result.files_to_send:
+            ctx._pending_files = result.files_to_send
+
         return result.answer
 
     else:
@@ -342,6 +382,8 @@ async def _handle_free(
         return await agent.direct_response(
             message=text,
             history=ctx.get_history_for_llm(),
+            style_guide=style_guide,
+            chat_id=ctx.chat_id,
         )
 
 
@@ -1574,6 +1616,16 @@ def _next_weekday(weekday: int) -> date:
     if days_ahead <= 0:
         days_ahead += 7
     return today + timedelta(days=days_ahead)
+
+
+def _extract_answer_from_json(text: str) -> str:
+    """
+    v3: 4-уровневая защита от утечки JSON.
+    Использует _clean_json_from_response из agent.py.
+    НИКОГДА не показывает сырой JSON пользователю.
+    """
+    from pds_ultimate.core.agent import _clean_json_from_response
+    return _clean_json_from_response(text)
 
 
 def _split_message(text: str, max_len: int = 4096) -> list[str]:

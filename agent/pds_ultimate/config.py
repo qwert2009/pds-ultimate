@@ -19,7 +19,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # ─── Загрузка .env ───────────────────────────────────────────────────────────
-load_dotenv()
+# .env лежит рядом с config.py (внутри pds_ultimate/)
+_THIS_DIR = Path(__file__).resolve().parent
+load_dotenv(_THIS_DIR / ".env")
 
 
 def _env(key: str, default: str = "") -> str:
@@ -134,6 +136,7 @@ class TelethonConfig:
     """Конфигурация Telegram Userbot для анализа чатов и мимикрии."""
     api_id: int = _env_int("TG_API_ID")
     api_hash: str = _env("TG_API_HASH")
+    phone: str = _env("TG_PHONE", "")
     session_name: str = _env("TG_SESSION_NAME", "pds_userbot")
     # Количество чатов для анализа стиля (по ТЗ: 7 чатов TG)
     style_analysis_chat_count: int = _env_int("TG_STYLE_CHATS", 7)
@@ -223,6 +226,20 @@ class GmailConfig:
         "https://www.googleapis.com/auth/gmail.modify",
         "https://www.googleapis.com/auth/gmail.send",
     ])
+
+
+# ─── SMTP Fallback ───────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class SmtpConfig:
+    """SMTP fallback для отправки email без OAuth."""
+    enabled: bool = _env_bool("SMTP_ENABLED", False)
+    host: str = _env("SMTP_HOST", "smtp.gmail.com")
+    port: int = int(_env("SMTP_PORT", "587"))
+    user: str = _env("SMTP_USER", "")  # email
+    password: str = _env("SMTP_PASSWORD", "")  # app password
+    use_tls: bool = _env_bool("SMTP_TLS", True)
+    from_name: str = _env("SMTP_FROM_NAME", "PDS-Ultimate")
 
 
 # ─── Валюты ──────────────────────────────────────────────────────────────────
@@ -432,6 +449,7 @@ class AppConfig:
     deepseek: DeepSeekConfig = field(default_factory=DeepSeekConfig)
     whisper: WhisperConfig = field(default_factory=WhisperConfig)
     gmail: GmailConfig = field(default_factory=GmailConfig)
+    smtp: SmtpConfig = field(default_factory=SmtpConfig)
     currency: CurrencyConfig = field(default_factory=CurrencyConfig)
     finance: FinanceConfig = field(default_factory=FinanceConfig)
     logistics: LogisticsConfig = field(default_factory=LogisticsConfig)

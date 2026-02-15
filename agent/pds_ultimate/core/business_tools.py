@@ -17,6 +17,7 @@ PDS-Ultimate Business Tools
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import date, timedelta
 
 from pds_ultimate.config import config, logger
@@ -574,7 +575,6 @@ async def tool_summarize(text: str, **kwargs) -> ToolResult:
 
 async def tool_security_emergency(db_session=None) -> ToolResult:
     """Активировать экстренный режим безопасности."""
-    import os
 
     from pds_ultimate.config import ALL_ORDERS_ARCHIVE_PATH, MASTER_FINANCE_PATH
     from pds_ultimate.core.database import Transaction
@@ -964,6 +964,1117 @@ async def tool_google_calendar_events(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# MESSAGING & FILES — TOOLS (ОТПРАВКА СООБЩЕНИЙ, СОЗДАНИЕ ФАЙЛОВ, EMAIL)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def tool_send_whatsapp(
+    contact_name: str = "",
+    phone: str = "",
+    message: str = "",
+    db_session=None,
+    **kwargs,
+) -> ToolResult:
+    """Отправить сообщение в WhatsApp через Green-API."""
+    from pds_ultimate.integrations.whatsapp import wa_client
+
+    if not message:
+        return ToolResult("send_whatsapp", False, "", error="Нужен текст сообщения")
+
+    # Определяем chat_id
+    chat_id = ""
+    if phone:
+        # Убираем +, пробелы
+        clean = phone.replace("+", "").replace(" ", "").replace("-", "")
+        chat_id = f"{clean}@c.us"
+    elif contact_name and db_session:
+        # Ищем контакт в БД
+        from pds_ultimate.core.database import Contact
+        contact = db_session.query(Contact).filter(
+            Contact.name.ilike(f"%{contact_name}%")
+        ).first()
+        if contact and contact.whatsapp_id:
+            chat_id = contact.whatsapp_id
+        elif contact and contact.phone:
+            clean = contact.phone.replace(
+                "+", "").replace(" ", "").replace("-", "")
+            chat_id = f"{clean}@c.us"
+        else:
+            return ToolResult(
+                "send_whatsapp", False, "",
+                error=f"Контакт '{contact_name}' не найден или не имеет номера WhatsApp. "
+                f"Укажи phone (номер телефона) явно.",
+            )
+    else:
+        return ToolResult(
+            "send_whatsapp", False, "",
+            error="Укажи contact_name (имя контакта) или phone (номер телефона)",
+        )
+
+    if not wa_client._started:
+        try:
+            await wa_client.start()
+        except Exception as e:
+            return ToolResult("send_whatsapp", False, "", error=f"WhatsApp не подключён: {e}")
+
+    success = await wa_client.send_message(chat_id, message)
+    if success:
+        return ToolResult(
+            "send_whatsapp", True,
+            f"✅ Сообщение отправлено в WhatsApp ({chat_id}):\n«{message[:200]}»",
+        )
+    return ToolResult("send_whatsapp", False, "", error="Не удалось отправить. Проверь авторизацию Green-API.")
+
+
+async def tool_read_telegram_chat(
+    username: str = "",
+    chat_id: int = 0,
+    contact_name: str = "",
+    limit: int = 20,
+    days: int = 30,
+    db_session=None,
+    **kwargs,
+) -> ToolResult:
+    """
+    Прочитать историю чата Telegram через Telethon userbot.
+    Работает по username (@milana), chat_id или contact_name (имя).
+    """
+    try:
+        from pds_ultimate.integrations.telethon_client import telethon_client
+
+        if not telethon_client._started:
+            return ToolResult(
+                "read_telegram_chat", False, "",
+                error="Telethon userbot не запущен — чтение чатов невозможно.",
+            )
+
+        # Smart resolve by name
+        if not username and not chat_id and contact_name:
+            from pds_ultimate.core.contact_book import contact_book
+            resolved = contact_book.resolve(
+                contact_name, db_session=db_session)
+            if resolved:
+                username = resolved.get("telegram", "")
+                chat_id = resolved.get("telegram_id", 0)
+
+        identifier = chat_id or username
+        if not identifier:
+            return ToolResult(
+                "read_telegram_chat", False, "",
+                error="Нужен username или chat_id.",
+            )
+
+        messages = await telethon_client.get_messages(
+            str(identifier), limit=limit, offset_days=days,
+        )
+
+        if not messages:
+            return ToolResult(
+                "read_telegram_chat", True,
+                f"💬 Чат с {username or chat_id}: сообщений за {days} дн. не найдено.",
+            )
+
+        lines = [f"💬 Чат с {username or chat_id} (последние {len(messages)}):"]
+        for m in messages[:limit]:
+            who = "🔵 Я" if m.get("is_owner") else "⚪ Собеседник"
+            date_str = m.get("date", "")[:16].replace("T", " ")
+            text_preview = (m.get("text") or "")[:200]
+            lines.append(f"  {who} [{date_str}]: {text_preview}")
+
+        return ToolResult(
+            "read_telegram_chat", True,
+            "\n".join(lines),
+            data={"messages": messages[:limit]},
+        )
+    except Exception as e:
+        return ToolResult(
+            "read_telegram_chat", False, "",
+            error=f"Ошибка чтения чата: {e}",
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# КОНТАКТНАЯ КНИГА (Smart Name → Contact Resolution)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def tool_link_contact(
+    name: str = "",
+    telegram: str = "",
+    phone: str = "",
+    email: str = "",
+    whatsapp: str = "",
+    db_session=None,
+    **kwargs,
+) -> ToolResult:
+    """
+    Привязать контактные данные к имени.
+    'запомни что у Миланы телеграм @milana_sagomonyan'
+    'сохрани что email Кирилла — kirill@mail.ru'
+    """
+    if not name:
+        return ToolResult("link_contact", False, "", error="Нужно указать имя контакта.")
+
+    if not any([telegram, phone, email, whatsapp]):
+        return ToolResult(
+            "link_contact", False, "",
+            error="Нужно указать хотя бы один контакт: telegram, phone, email или whatsapp.",
+        )
+
+    from pds_ultimate.core.contact_book import contact_book
+
+    result = contact_book.link(
+        name=name,
+        telegram=telegram,
+        phone=phone,
+        email=email,
+        whatsapp=whatsapp,
+        db_session=db_session,
+    )
+
+    if "error" in result:
+        return ToolResult("link_contact", False, "", error=result["error"])
+
+    parts = [f"✅ Контакт «{result.get('name', name)}» обновлён:"]
+    if result.get("telegram"):
+        parts.append(f"  📱 Telegram: @{result['telegram']}")
+    if result.get("phone"):
+        parts.append(f"  📞 Телефон: {result['phone']}")
+    if result.get("email"):
+        parts.append(f"  📧 Email: {result['email']}")
+    if result.get("whatsapp"):
+        parts.append(f"  💬 WhatsApp: {result['whatsapp']}")
+
+    return ToolResult("link_contact", True, "\n".join(parts))
+
+
+async def tool_resolve_contact(
+    name: str = "",
+    db_session=None,
+    **kwargs,
+) -> ToolResult:
+    """
+    Найти контакт по имени, нику или прозвищу.
+    Поддерживает падежи и уменьшительные: 'Милане', 'Серёга', 'Кирюха'.
+    """
+    if not name:
+        return ToolResult("resolve_contact", False, "", error="Нужно указать имя.")
+
+    from pds_ultimate.core.contact_book import contact_book
+
+    contact = contact_book.resolve(name, db_session=db_session)
+    if not contact:
+        return ToolResult(
+            "resolve_contact", True,
+            f"🔍 Контакт «{name}» не найден. "
+            f"Привяжи: 'запомни что у {name} телеграм @username'",
+        )
+
+    parts = [f"📇 {contact.get('name', name)}:"]
+    if contact.get("telegram"):
+        parts.append(f"  📱 Telegram: @{contact['telegram']}")
+    if contact.get("telegram_id"):
+        parts.append(f"  🆔 TG ID: {contact['telegram_id']}")
+    if contact.get("phone"):
+        parts.append(f"  📞 Телефон: {contact['phone']}")
+    if contact.get("email"):
+        parts.append(f"  📧 Email: {contact['email']}")
+    if contact.get("whatsapp"):
+        parts.append(f"  💬 WhatsApp: {contact['whatsapp']}")
+    if contact.get("notes"):
+        parts.append(f"  📝 {contact['notes'][:100]}")
+
+    return ToolResult("resolve_contact", True, "\n".join(parts), data=contact)
+
+
+async def tool_list_contacts(db_session=None, **kwargs) -> ToolResult:
+    """Показать все контакты из адресной книги."""
+    from pds_ultimate.core.contact_book import contact_book
+
+    contacts = contact_book.list_all()
+    if not contacts:
+        return ToolResult("list_contacts", True, "📇 Адресная книга пуста.")
+
+    lines = [f"📇 Адресная книга ({len(contacts)} контактов):"]
+    for c in contacts:
+        info = f"• {c.get('name', '?')}"
+        if c.get("telegram"):
+            info += f" — @{c['telegram']}"
+        if c.get("phone"):
+            info += f" | {c['phone']}"
+        if c.get("email"):
+            info += f" | {c['email']}"
+        lines.append(info)
+
+    return ToolResult("list_contacts", True, "\n".join(lines))
+
+
+async def tool_send_telegram(
+    username: str = "",
+    chat_id: int = 0,
+    contact_name: str = "",
+    message: str = "",
+    db_session=None,
+    **kwargs,
+) -> ToolResult:
+    """
+    Отправить сообщение в Telegram.
+    v4: Telethon primary для username, Bot API для chat_id.
+    """
+    if not message:
+        return ToolResult("send_telegram", False, "", error="Нужен текст сообщения")
+
+    # Определяем получателя
+    recipient_id = None
+    recipient_username = ""
+    recipient_label = ""
+
+    if chat_id:
+        recipient_id = int(chat_id)
+        recipient_label = str(chat_id)
+    elif contact_name:
+        # Smart resolve через ContactBook
+        from pds_ultimate.core.contact_book import contact_book
+        resolved = contact_book.resolve(contact_name, db_session=db_session)
+        if resolved:
+            if resolved.get("telegram_id"):
+                recipient_id = resolved["telegram_id"]
+                recipient_label = f"{resolved.get('name', contact_name)} ({recipient_id})"
+            elif resolved.get("telegram"):
+                recipient_username = resolved["telegram"].lstrip("@")
+                recipient_label = f"@{recipient_username}"
+            else:
+                return ToolResult(
+                    "send_telegram", False, "",
+                    error=f"Контакт '{contact_name}' найден, но нет Telegram данных. "
+                    f"Привяжи: 'запомни что у {contact_name} телеграм @username'",
+                )
+        else:
+            return ToolResult(
+                "send_telegram", False, "",
+                error=f"Контакт '{contact_name}' не найден. Укажи username напрямую.",
+            )
+    elif username:
+        recipient_username = username.lstrip("@")
+        recipient_label = f"@{recipient_username}"
+
+    # Strategy 1: Telethon userbot — работает по username и chat_id
+    try:
+        from pds_ultimate.integrations.telethon_client import telethon_client
+
+        if telethon_client._started and telethon_client._client:
+            target = recipient_id or recipient_username
+            if target:
+                await telethon_client._client.send_message(target, message)
+                return ToolResult(
+                    "send_telegram", True,
+                    f"✅ Сообщение отправлено ({recipient_label or target}):\n«{message[:200]}»",
+                )
+    except Exception as e:
+        logger.warning(f"Telethon send failed: {e}")
+
+    # Strategy 2: Bot API fallback (только с chat_id)
+    if recipient_id:
+        try:
+            from pds_ultimate.bot.setup import bot as tg_bot
+            if tg_bot:
+                await tg_bot.send_message(chat_id=recipient_id, text=message)
+                return ToolResult(
+                    "send_telegram", True,
+                    f"✅ Сообщение отправлено через Bot API ({recipient_label}):\n«{message[:200]}»",
+                )
+        except Exception as e:
+            logger.warning(f"Bot API send failed: {e}")
+
+    # Both failed
+    if not recipient_id and not recipient_username:
+        return ToolResult(
+            "send_telegram", False, "",
+            error="Нужен username или chat_id получателя.",
+        )
+
+    return ToolResult(
+        "send_telegram", False, "",
+        error=f"Не удалось отправить сообщение ({recipient_label}). "
+        f"Telethon userbot может быть не запущен.",
+    )
+
+
+async def tool_send_email(
+    to: str = "",
+    subject: str = "",
+    body: str = "",
+    contact_name: str = "",
+    db_session=None,
+    **kwargs,
+) -> ToolResult:
+    """Отправить email через Gmail API или SMTP fallback."""
+    if not body:
+        return ToolResult("send_email", False, "", error="Нужен текст письма (body)")
+
+    # Определяем получателя
+    if not to and contact_name:
+        from pds_ultimate.core.contact_book import contact_book
+        resolved_email = contact_book.resolve_email(
+            contact_name, db_session=db_session)
+        if resolved_email:
+            to = resolved_email
+        else:
+            return ToolResult(
+                "send_email", False, "",
+                error=f"Контакт '{contact_name}' не найден или нет email. "
+                f"Привяжи: 'запомни что email {contact_name} — user@example.com'",
+            )
+
+    if not to:
+        return ToolResult("send_email", False, "", error="Укажи email получателя (to)")
+
+    if not subject:
+        subject = "Без темы"
+
+    # ─── Способ 1: Gmail API (если подключён) ───────────────────────
+    try:
+        from pds_ultimate.integrations.gmail import gmail_client
+        if gmail_client._started:
+            result = await gmail_client.send_email(to=to, subject=subject, body=body)
+            if not result.get("error"):
+                return ToolResult(
+                    "send_email", True,
+                    f"✅ Письмо отправлено (Gmail API) → {to}\nТема: {subject}",
+                )
+            logger.warning(
+                f"Gmail API ошибка: {result['error']}, пробуем SMTP...")
+    except Exception as e:
+        logger.warning(f"Gmail API недоступен: {e}, пробуем SMTP...")
+
+    # ─── Способ 2: SMTP Fallback ────────────────────────────────────
+    try:
+        from pds_ultimate.config import config as cfg
+        smtp_cfg = cfg.smtp
+        if not smtp_cfg.enabled or not smtp_cfg.user or not smtp_cfg.password:
+            return ToolResult(
+                "send_email", False, "",
+                error=(
+                    "⚠️ Не удалось отправить email: Gmail API не подключён, "
+                    "SMTP не настроен.\n"
+                    "Для настройки SMTP:\n"
+                    "1. Включите 2FA в Google аккаунте\n"
+                    "2. Создайте App Password: https://myaccount.google.com/apppasswords\n"
+                    "3. В .env: SMTP_ENABLED=true, SMTP_USER=ваш@gmail.com, SMTP_PASSWORD=ваш_app_password"
+                ),
+            )
+
+        import asyncio
+        import smtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+
+        def _send_smtp():
+            msg = MIMEMultipart("alternative")
+            msg["From"] = f"{smtp_cfg.from_name} <{smtp_cfg.user}>"
+            msg["To"] = to
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "plain", "utf-8"))
+            # HTML версия
+            html_body = body.replace("\n", "<br>")
+            msg.attach(
+                MIMEText(f"<html><body>{html_body}</body></html>", "html", "utf-8"))
+
+            if smtp_cfg.use_tls:
+                server = smtplib.SMTP(smtp_cfg.host, smtp_cfg.port, timeout=15)
+                server.ehlo()
+                server.starttls()
+            else:
+                server = smtplib.SMTP_SSL(
+                    smtp_cfg.host, smtp_cfg.port, timeout=15)
+
+            server.login(smtp_cfg.user, smtp_cfg.password)
+            server.send_message(msg)
+            server.quit()
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _send_smtp)
+
+        return ToolResult(
+            "send_email", True,
+            f"✅ Письмо отправлено (SMTP) → {to}\nТема: {subject}",
+        )
+
+    except Exception as e:
+        err_str = str(e)
+        if "SMTPAuthenticationError" in type(e).__name__ or "535" in err_str:
+            return ToolResult(
+                "send_email", False, "",
+                error="❌ SMTP: неверный пароль. Используйте App Password из https://myaccount.google.com/apppasswords",
+            )
+        return ToolResult("send_email", False, "", error=f"❌ Ошибка отправки email: {e}")
+
+
+async def tool_get_emails(
+    account: str = "",
+    max_results: int = 5,
+    **kwargs,
+) -> ToolResult:
+    """Получить непрочитанные письма из Gmail."""
+    from pds_ultimate.integrations.gmail import gmail_client
+
+    if not gmail_client._started:
+        try:
+            await gmail_client.start()
+        except Exception as e:
+            return ToolResult("get_emails", False, "", error=f"Gmail не подключён: {e}")
+
+    emails = await gmail_client.get_unread(max_results=max_results, account=account or None)
+    if not emails:
+        return ToolResult("get_emails", True, "📭 Нет непрочитанных писем.")
+
+    lines = [f"📬 Непрочитанных: {len(emails)}\n"]
+    for i, em in enumerate(emails, 1):
+        lines.append(
+            f"{i}. От: {em.get('from', '?')}\n"
+            f"   Тема: {em.get('subject', '?')}\n"
+            f"   Дата: {em.get('date', '?')}\n"
+            f"   Превью: {em.get('snippet', '')[:100]}...\n"
+        )
+    return ToolResult("get_emails", True, "\n".join(lines), data={"emails": emails})
+
+
+async def tool_create_file(
+    description: str = "",
+    file_format: str = "",
+    **kwargs,
+) -> ToolResult:
+    """Создать файл (Excel, Word, PDF, CSV, TXT) по описанию и отправить пользователю."""
+    if not description:
+        return ToolResult("create_file", False, "", error="Опиши что создать (description)")
+
+    try:
+        import json as json_mod
+        import os
+        from datetime import datetime
+
+        from pds_ultimate.config import USER_FILES_DIR
+        from pds_ultimate.core.llm_engine import llm_engine
+
+        os.makedirs(str(USER_FILES_DIR), exist_ok=True)
+
+        # Определяем формат если не указан
+        if not file_format:
+            fmt_lower = description.lower()
+            if any(w in fmt_lower for w in ["excel", "таблиц", "xlsx", "эксель"]):
+                file_format = "xlsx"
+            elif any(w in fmt_lower for w in ["word", "документ", "docx"]):
+                file_format = "docx"
+            elif any(w in fmt_lower for w in ["pdf"]):
+                file_format = "pdf"
+            elif any(w in fmt_lower for w in ["csv"]):
+                file_format = "csv"
+            else:
+                file_format = "xlsx"
+
+        # Генерируем структуру через LLM
+        prompt = (
+            f"Создай структуру для файла формата {file_format} по запросу: «{description}».\n"
+            f"Верни JSON: {{\"title\": \"...\", \"headers\": [\"col1\", ...], \"rows\": [[\"val1\", ...], ...]}}\n"
+            f"Добавь примерные данные (5-10 строк). Только JSON, без объяснений."
+        )
+
+        raw = await llm_engine.chat(message=prompt, task_type="general", temperature=0.5, json_mode=True)
+        try:
+            structure = json_mod.loads(raw)
+        except Exception:
+            structure = {"title": description[:50], "headers": [
+                "Данные"], "rows": [["Пример"]]}
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_title = structure.get("title", "doc").replace(" ", "_")[:30]
+        filename = f"{ts}_{safe_title}.{file_format}"
+        filepath = str(USER_FILES_DIR / filename)
+
+        if file_format == "xlsx":
+            from pds_ultimate.modules.files.excel_engine import ExcelEngine
+            engine = ExcelEngine()
+            await engine.create(filepath, structure)
+        elif file_format == "csv":
+            import csv
+            with open(filepath, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(structure.get("headers", []))
+                for row in structure.get("rows", []):
+                    writer.writerow(row)
+        elif file_format == "docx":
+            from docx import Document
+            doc = Document()
+            doc.add_heading(structure.get("title", description[:50]), 0)
+            if structure.get("headers"):
+                table = doc.add_table(rows=1, cols=len(structure["headers"]))
+                table.style = "Table Grid"
+                for i, h in enumerate(structure["headers"]):
+                    table.rows[0].cells[i].text = str(h)
+                for row_data in structure.get("rows", []):
+                    row = table.add_row()
+                    for i, cell in enumerate(row_data):
+                        if i < len(row.cells):
+                            row.cells[i].text = str(cell)
+                doc.save(filepath)
+        elif file_format == "pdf":
+            from fpdf import FPDF
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font("Helvetica", size=14)
+            pdf.cell(200, 10, txt=structure.get(
+                "title", "Document"), ln=True, align="C")
+            pdf.set_font("Helvetica", size=10)
+            for row in structure.get("rows", []):
+                pdf.cell(200, 8, txt=" | ".join(str(c) for c in row), ln=True)
+            pdf.output(filepath)
+        else:
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(structure.get("title", "") + "\n\n")
+                for row in structure.get("rows", []):
+                    f.write("\t".join(str(c) for c in row) + "\n")
+
+        return ToolResult(
+            "create_file", True,
+            f"✅ Файл создан: {filename}",
+            data={"filepath": filepath, "filename": filename, "send_file": True},
+        )
+    except Exception as e:
+        return ToolResult("create_file", False, "", error=f"Ошибка создания файла: {e}")
+
+
+async def tool_create_excel(
+    title: str = "Таблица",
+    headers: str = "",
+    rows: str = "",
+    **kwargs,
+) -> ToolResult:
+    """Создать Excel файл с данными и отправить пользователю."""
+    try:
+        import os
+        from datetime import datetime
+
+        from pds_ultimate.config import USER_FILES_DIR
+        from pds_ultimate.modules.files.excel_engine import ExcelEngine
+
+        engine = ExcelEngine()
+
+        # Parse headers and rows
+        header_list = [h.strip() for h in headers.split(",") if h.strip()] if headers else [
+            "Колонка 1", "Колонка 2", "Колонка 3"]
+        row_list = []
+        if rows:
+            for row_str in rows.split(";"):
+                cells = [c.strip() for c in row_str.split(",")]
+                row_list.append(cells)
+        else:
+            # Примерные данные
+            row_list = [
+                ["Пример 1", "Значение A", "100"],
+                ["Пример 2", "Значение B", "200"],
+                ["Пример 3", "Значение C", "300"],
+            ]
+
+        structure = {
+            "title": title,
+            "headers": header_list,
+            "rows": row_list,
+        }
+
+        os.makedirs(str(USER_FILES_DIR), exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_title = title.replace(" ", "_")[:30]
+        filename = f"{ts}_{safe_title}.xlsx"
+        filepath = str(USER_FILES_DIR / filename)
+
+        result = await engine.create(filepath, structure)
+        if result.get("success") or result.get("filepath"):
+            return ToolResult(
+                "create_excel", True,
+                f"✅ Excel файл создан: {filename}",
+                data={"filepath": filepath,
+                      "filename": filename, "send_file": True},
+            )
+        return ToolResult("create_excel", False, "", error=f"Ошибка: {result}")
+    except Exception as e:
+        return ToolResult("create_excel", False, "", error=f"Ошибка создания Excel: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM BOT API — CHAT MANAGEMENT (без Telethon, без my.telegram.org)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def tool_telegram_get_chat_info(
+    chat_id: int = 0,
+    **kwargs,
+) -> ToolResult:
+    """Получить информацию о чате через Bot API."""
+    if not chat_id:
+        return ToolResult("telegram_get_chat_info", False, "", error="Укажи chat_id")
+
+    try:
+        from pds_ultimate.bot.setup import bot as tg_bot
+        if not tg_bot:
+            return ToolResult("telegram_get_chat_info", False, "", error="Бот не инициализирован")
+
+        chat = await tg_bot.get_chat(chat_id=int(chat_id))
+        lines = [
+            "💬 Информация о чате:",
+            f"  🆔 ID: {chat.id}",
+            f"  📋 Тип: {chat.type}",
+        ]
+        if chat.title:
+            lines.append(f"  📌 Название: {chat.title}")
+        if chat.username:
+            lines.append(f"  👤 Username: @{chat.username}")
+        if chat.first_name:
+            lines.append(f"  🧑 Имя: {chat.first_name} {chat.last_name or ''}")
+        if chat.bio:
+            lines.append(f"  📝 Био: {chat.bio}")
+        if chat.description:
+            lines.append(f"  📄 Описание: {chat.description[:200]}")
+
+        return ToolResult(
+            "telegram_get_chat_info", True, "\n".join(lines),
+            data={
+                "id": chat.id,
+                "type": chat.type,
+                "title": chat.title,
+                "username": chat.username,
+                "first_name": chat.first_name,
+                "last_name": chat.last_name,
+            },
+        )
+    except Exception as e:
+        return ToolResult("telegram_get_chat_info", False, "", error=f"Ошибка: {e}")
+
+
+async def tool_telegram_forward_message(
+    from_chat_id: int = 0,
+    to_chat_id: int = 0,
+    message_id: int = 0,
+    **kwargs,
+) -> ToolResult:
+    """Переслать сообщение из одного чата в другой через Bot API."""
+    if not all([from_chat_id, to_chat_id, message_id]):
+        return ToolResult(
+            "telegram_forward_message", False, "",
+            error="Нужны from_chat_id, to_chat_id и message_id",
+        )
+
+    try:
+        from pds_ultimate.bot.setup import bot as tg_bot
+        if not tg_bot:
+            return ToolResult("telegram_forward_message", False, "", error="Бот не инициализирован")
+
+        result = await tg_bot.forward_message(
+            chat_id=int(to_chat_id),
+            from_chat_id=int(from_chat_id),
+            message_id=int(message_id),
+        )
+        return ToolResult(
+            "telegram_forward_message", True,
+            f"✅ Сообщение переслано: {from_chat_id} → {to_chat_id} (msg_id: {result.message_id})",
+        )
+    except Exception as e:
+        return ToolResult("telegram_forward_message", False, "", error=f"Ошибка: {e}")
+
+
+async def tool_telegram_pin_message(
+    chat_id: int = 0,
+    message_id: int = 0,
+    **kwargs,
+) -> ToolResult:
+    """Закрепить сообщение в чате через Bot API."""
+    if not chat_id or not message_id:
+        return ToolResult("telegram_pin_message", False, "", error="Нужны chat_id и message_id")
+
+    try:
+        from pds_ultimate.bot.setup import bot as tg_bot
+        if not tg_bot:
+            return ToolResult("telegram_pin_message", False, "", error="Бот не инициализирован")
+
+        await tg_bot.pin_chat_message(
+            chat_id=int(chat_id),
+            message_id=int(message_id),
+            disable_notification=True,
+        )
+        return ToolResult(
+            "telegram_pin_message", True,
+            f"📌 Сообщение закреплено в чате {chat_id}",
+        )
+    except Exception as e:
+        return ToolResult("telegram_pin_message", False, "", error=f"Ошибка: {e}")
+
+
+async def tool_telegram_manage_chat(
+    action: str = "info",
+    chat_id: int = 0,
+    user_id: int = 0,
+    title: str = "",
+    description: str = "",
+    **kwargs,
+) -> ToolResult:
+    """
+    Управление чатом/группой через Bot API.
+    Действия: info, set_title, set_description, ban, unban, get_members_count.
+    Бот должен быть админом группы.
+    """
+    if not chat_id:
+        return ToolResult("telegram_manage_chat", False, "", error="Укажи chat_id")
+
+    try:
+        from pds_ultimate.bot.setup import bot as tg_bot
+        if not tg_bot:
+            return ToolResult("telegram_manage_chat", False, "", error="Бот не инициализирован")
+
+        if action == "info":
+            chat = await tg_bot.get_chat(chat_id=int(chat_id))
+            count = await tg_bot.get_chat_member_count(chat_id=int(chat_id))
+            lines = [
+                f"💬 Чат: {chat.title or chat.first_name or chat_id}",
+                f"  🆔 ID: {chat.id}",
+                f"  📋 Тип: {chat.type}",
+                f"  👥 Участников: {count}",
+            ]
+            if chat.description:
+                lines.append(f"  📄 Описание: {chat.description[:200]}")
+            return ToolResult("telegram_manage_chat", True, "\n".join(lines))
+
+        elif action == "set_title" and title:
+            await tg_bot.set_chat_title(chat_id=int(chat_id), title=title)
+            return ToolResult("telegram_manage_chat", True, f"✅ Название изменено: {title}")
+
+        elif action == "set_description":
+            await tg_bot.set_chat_description(chat_id=int(chat_id), description=description)
+            return ToolResult("telegram_manage_chat", True, "✅ Описание обновлено")
+
+        elif action == "ban" and user_id:
+            await tg_bot.ban_chat_member(chat_id=int(chat_id), user_id=int(user_id))
+            return ToolResult("telegram_manage_chat", True, f"🚫 Пользователь {user_id} заблокирован")
+
+        elif action == "unban" and user_id:
+            await tg_bot.unban_chat_member(chat_id=int(chat_id), user_id=int(user_id), only_if_banned=True)
+            return ToolResult("telegram_manage_chat", True, f"✅ Пользователь {user_id} разблокирован")
+
+        elif action == "get_members_count":
+            count = await tg_bot.get_chat_member_count(chat_id=int(chat_id))
+            return ToolResult("telegram_manage_chat", True, f"👥 Участников: {count}")
+
+        else:
+            return ToolResult(
+                "telegram_manage_chat", False, "",
+                error=f"Неизвестное действие: {action}. Доступны: info, set_title, set_description, ban, unban, get_members_count",
+            )
+
+    except Exception as e:
+        return ToolResult("telegram_manage_chat", False, "", error=f"Ошибка: {e}")
+
+
+async def tool_telegram_send_photo(
+    chat_id: int = 0,
+    photo_path: str = "",
+    caption: str = "",
+    **kwargs,
+) -> ToolResult:
+    """Отправить фото в Telegram через Bot API."""
+    if not chat_id or not photo_path:
+        return ToolResult("telegram_send_photo", False, "", error="Нужны chat_id и photo_path")
+
+    try:
+        import os
+
+        from aiogram.types import FSInputFile
+
+        from pds_ultimate.bot.setup import bot as tg_bot
+        if not tg_bot:
+            return ToolResult("telegram_send_photo", False, "", error="Бот не инициализирован")
+
+        if not os.path.exists(photo_path):
+            return ToolResult("telegram_send_photo", False, "", error=f"Файл не найден: {photo_path}")
+
+        photo = FSInputFile(photo_path)
+        await tg_bot.send_photo(chat_id=int(chat_id), photo=photo, caption=caption or None)
+        return ToolResult(
+            "telegram_send_photo", True,
+            f"📷 Фото отправлено в чат {chat_id}",
+        )
+    except Exception as e:
+        return ToolResult("telegram_send_photo", False, "", error=f"Ошибка: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SANDBOX TOOLS (handlers) — Safe file operations
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def tool_sandbox_read_file(path: str, start_line: int = 0, end_line: int = 0, **kwargs) -> ToolResult:
+    """Read file via sandbox engine."""
+    from pds_ultimate.core.sandbox_engine import sandbox
+    try:
+        result = sandbox.read_file(
+            path,
+            start_line=int(start_line) if start_line else None,
+            end_line=int(end_line) if end_line else None,
+        )
+        return ToolResult("sandbox_read_file", True, result)
+    except Exception as e:
+        return ToolResult("sandbox_read_file", False, "", error=str(e))
+
+
+async def tool_sandbox_edit_file(
+    path: str, edits: str, create_backup: bool = True, **kwargs
+) -> ToolResult:
+    """Edit file safely with backup + AST validation."""
+    import json as _json
+
+    from pds_ultimate.core.sandbox_engine import sandbox
+    try:
+        edits_list = _json.loads(edits) if isinstance(edits, str) else edits
+        result = sandbox.edit_file(
+            path, edits_list, create_backup=bool(create_backup))
+        return ToolResult("sandbox_edit_file", True, result)
+    except _json.JSONDecodeError:
+        return ToolResult("sandbox_edit_file", False, "",
+                          error="edits должен быть валидный JSON массив")
+    except Exception as e:
+        return ToolResult("sandbox_edit_file", False, "", error=str(e))
+
+
+async def tool_sandbox_create_file(path: str, content: str, **kwargs) -> ToolResult:
+    """Create file with syntax validation."""
+    from pds_ultimate.core.sandbox_engine import sandbox
+    try:
+        result = sandbox.create_file(path, content)
+        return ToolResult("sandbox_create_file", True, result)
+    except Exception as e:
+        return ToolResult("sandbox_create_file", False, "", error=str(e))
+
+
+async def tool_sandbox_run_code(code: str, timeout: int = 30, **kwargs) -> ToolResult:
+    """Execute Python code in sandbox."""
+    from pds_ultimate.core.sandbox_engine import sandbox
+    try:
+        result = sandbox.execute_code(code, timeout=int(timeout))
+        return ToolResult("sandbox_run_code", True, result)
+    except Exception as e:
+        return ToolResult("sandbox_run_code", False, "", error=str(e))
+
+
+async def tool_sandbox_search_files(
+    pattern: str, directory: str = "", extensions: str = "",
+    regex: bool = False, **kwargs
+) -> ToolResult:
+    """Search files by pattern (grep-like)."""
+    from pds_ultimate.core.sandbox_engine import sandbox
+    try:
+        ext_list = [e.strip() for e in extensions.split(
+            ",") if e.strip()] if extensions else None
+        result = sandbox.search_in_files(
+            pattern, directory=directory or None,
+            extensions=ext_list, regex=bool(regex),
+        )
+        return ToolResult("sandbox_search_files", True, result)
+    except Exception as e:
+        return ToolResult("sandbox_search_files", False, "", error=str(e))
+
+
+async def tool_sandbox_list_dir(path: str = "", max_depth: int = 3, **kwargs) -> ToolResult:
+    """List directory tree."""
+    from pds_ultimate.core.sandbox_engine import sandbox
+    try:
+        result = sandbox.list_directory(path or None, max_depth=int(max_depth))
+        return ToolResult("sandbox_list_dir", True, result)
+    except Exception as e:
+        return ToolResult("sandbox_list_dir", False, "", error=str(e))
+
+
+async def tool_sandbox_csv_read(path: str, max_rows: int = 30, **kwargs) -> ToolResult:
+    """Read CSV with formatted table."""
+    from pds_ultimate.core.sandbox_engine import sandbox
+    try:
+        result = sandbox.read_csv(path, max_rows=int(max_rows))
+        return ToolResult("sandbox_csv_read", True, result)
+    except Exception as e:
+        return ToolResult("sandbox_csv_read", False, "", error=str(e))
+
+
+async def tool_sandbox_csv_edit(path: str, operations: str, **kwargs) -> ToolResult:
+    """Edit CSV file."""
+    import json as _json
+
+    from pds_ultimate.core.sandbox_engine import sandbox
+    try:
+        ops = _json.loads(operations) if isinstance(
+            operations, str) else operations
+        result = sandbox.edit_csv(path, ops)
+        return ToolResult("sandbox_csv_edit", True, result)
+    except _json.JSONDecodeError:
+        return ToolResult("sandbox_csv_edit", False, "",
+                          error="operations должен быть валидный JSON массив")
+    except Exception as e:
+        return ToolResult("sandbox_csv_edit", False, "", error=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WIDE RESEARCH TOOLS (handlers) — Parallel sub-agents
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def tool_wide_research(query: str, max_sources: int = 5, **kwargs) -> ToolResult:
+    """Wide research with parallel sub-agents."""
+    from pds_ultimate.core.wide_research import wide_research
+    try:
+        report = await wide_research.research(
+            query=query,
+            max_sources_per_query=int(max_sources),
+        )
+        return ToolResult(
+            "wide_research", True, report.summary(),
+            data={
+                "total_findings": len(report.findings),
+                "contradictions": len(report.contradictions),
+                "insights": report.insights[:3] if report.insights else [],
+                "confidence": report.overall_confidence,
+            },
+        )
+    except Exception as e:
+        return ToolResult("wide_research", False, "", error=f"Ошибка исследования: {e}")
+
+
+async def tool_quick_research(query: str, max_sources: int = 3, **kwargs) -> ToolResult:
+    """Quick research without LLM."""
+    from pds_ultimate.core.wide_research import wide_research
+    try:
+        report = await wide_research.quick_research(
+            query=query, max_sources=int(max_sources),
+        )
+        return ToolResult(
+            "quick_research_v2", True, report.summary(),
+            data={
+                "findings": len(report.findings),
+                "confidence": report.overall_confidence,
+            },
+        )
+    except Exception as e:
+        return ToolResult("quick_research_v2", False, "", error=str(e))
+
+
+async def tool_compare_research(items: str, criteria: str = "", **kwargs) -> ToolResult:
+    """Compare N items on M criteria via parallel research."""
+    from pds_ultimate.core.wide_research import wide_research
+    try:
+        items_list = [i.strip() for i in items.split(",") if i.strip()]
+        criteria_list = [c.strip() for c in criteria.split(
+            ",") if c.strip()] if criteria else None
+        if len(items_list) < 2:
+            return ToolResult("compare_research", False, "",
+                              error="Нужно минимум 2 объекта для сравнения (через запятую)")
+        report = await wide_research.compare_research(
+            items=items_list, criteria=criteria_list,
+        )
+        return ToolResult(
+            "compare_research", True, report.summary(),
+            data={"items": items_list, "findings": len(report.findings)},
+        )
+    except Exception as e:
+        return ToolResult("compare_research", False, "", error=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATA ANALYSIS TOOLS (handlers) — Built-in analytics
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def tool_analyze_data(path: str, generate_charts: bool = True, **kwargs) -> ToolResult:
+    """Full EDA on a data file."""
+    from pds_ultimate.core.data_analysis import data_engine
+    try:
+        result = await data_engine.eda(path, generate_charts=bool(generate_charts))
+        if not result.success:
+            return ToolResult("analyze_data", False, "", error=result.error)
+        data = result.data.copy()
+        if result.charts:
+            data["charts"] = result.charts
+            data["send_file"] = True
+            data["filepath"] = result.charts[0]
+            data["filename"] = os.path.basename(result.charts[0])
+        return ToolResult("analyze_data", True, result.full_summary(), data=data)
+    except Exception as e:
+        return ToolResult("analyze_data", False, "", error=str(e))
+
+
+async def tool_create_chart(
+    path: str, x_column: str, y_column: str,
+    chart_type: str = "bar", title: str = "", **kwargs
+) -> ToolResult:
+    """Create chart from data file."""
+    from pds_ultimate.core.data_analysis import data_engine
+    try:
+        result = await data_engine.generate_chart(
+            path, x_column, y_column,
+            chart_type=chart_type, title=title,
+        )
+        if not result.success:
+            return ToolResult("create_chart", False, "", error=result.error)
+        data = result.data.copy()
+        if result.charts:
+            data["send_file"] = True
+            data["filepath"] = result.charts[0]
+            data["filename"] = os.path.basename(result.charts[0])
+        return ToolResult("create_chart", True, result.full_summary(), data=data)
+    except Exception as e:
+        return ToolResult("create_chart", False, "", error=str(e))
+
+
+async def tool_data_filter(
+    path: str, column: str, condition: str, value: str = "", **kwargs
+) -> ToolResult:
+    """Filter data by condition."""
+    from pds_ultimate.core.data_analysis import data_engine
+    try:
+        result = await data_engine.filter_data(path, column, condition, value)
+        if not result.success:
+            return ToolResult("data_filter", False, "", error=result.error)
+        return ToolResult("data_filter", True, result.full_summary(), data=result.data)
+    except Exception as e:
+        return ToolResult("data_filter", False, "", error=str(e))
+
+
+async def tool_data_group_by(
+    path: str, group_column: str,
+    agg_column: str = "", agg_func: str = "count", **kwargs
+) -> ToolResult:
+    """Group by with aggregation."""
+    from pds_ultimate.core.data_analysis import data_engine
+    try:
+        result = await data_engine.group_by(path, group_column, agg_column, agg_func)
+        if not result.success:
+            return ToolResult("data_group_by", False, "", error=result.error)
+        data = result.data.copy()
+        if result.charts:
+            data["send_file"] = True
+            data["filepath"] = result.charts[0]
+            data["filename"] = os.path.basename(result.charts[0])
+        return ToolResult("data_group_by", True, result.full_summary(), data=data)
+    except Exception as e:
+        return ToolResult("data_group_by", False, "", error=str(e))
+
+
+async def tool_data_stats(path: str, column: str = "", **kwargs) -> ToolResult:
+    """Detailed statistics."""
+    from pds_ultimate.core.data_analysis import data_engine
+    try:
+        result = await data_engine.compute_stats(path, column=column)
+        if not result.success:
+            return ToolResult("data_stats", False, "", error=result.error)
+        return ToolResult("data_stats", True, result.full_summary(), data=result.data)
+    except Exception as e:
+        return ToolResult("data_stats", False, "", error=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # РЕГИСТРАЦИЯ ВСЕХ TOOLS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1172,7 +2283,7 @@ def register_all_tools() -> int:
             category="memory",
         ),
 
-        # ─── Браузер ────────────────────────────────────────────────
+        # ─── Браузер (Manus-level) ────────────────────────────────────
         Tool(
             name="web_search",
             description=(
@@ -1191,7 +2302,7 @@ def register_all_tools() -> int:
         Tool(
             name="open_page",
             description=(
-                "Открыть веб-страницу и извлечь её содержимое "
+                "Открыть веб-страницу и извлечь содержимое "
                 "(текст, ссылки, таблицы, мета-данные). "
                 "Используй после web_search чтобы прочитать конкретную страницу."
             ),
@@ -1202,8 +2313,53 @@ def register_all_tools() -> int:
             category="browser",
         ),
         Tool(
+            name="search_and_read",
+            description=(
+                "Manus-level: Поиск → автоматически открывает топ-N страниц → "
+                "извлекает текст со всех. Идеально для быстрого исследования "
+                "вопроса. Возвращает контент с нескольких источников сразу."
+            ),
+            parameters=[
+                ToolParameter("query", "string", "Поисковый запрос", True),
+                ToolParameter("max_pages", "number",
+                              "Сколько страниц открыть (1-5)", False, 3),
+            ],
+            handler=tool_search_and_read,
+            category="browser",
+        ),
+        Tool(
+            name="deep_web_research",
+            description=(
+                "Глубокое исследование: поиск → открытие страниц → "
+                "переход по релевантным ссылкам → сбор данных из всех "
+                "источников. Для сложных вопросов где нужно много фактов."
+            ),
+            parameters=[
+                ToolParameter("query", "string", "Тема исследования", True),
+                ToolParameter("max_sources", "number",
+                              "Макс. источников (1-10)", False, 5),
+            ],
+            handler=tool_deep_web_research,
+            category="browser",
+        ),
+        Tool(
+            name="extract_page_data",
+            description=(
+                "Извлечь структурированные данные со страницы: "
+                "заголовки, таблицы, ссылки, мета-теги. "
+                "Можно указать фокус для фильтрации по теме."
+            ),
+            parameters=[
+                ToolParameter("url", "string", "URL страницы", True),
+                ToolParameter("focus", "string",
+                              "На чём сфокусироваться (опционально)", False),
+            ],
+            handler=tool_extract_page_data,
+            category="browser",
+        ),
+        Tool(
             name="browser_screenshot",
-            description="Сделать скриншот текущей страницы в браузере.",
+            description="Сделать скриншот текущей страницы в браузере (Playwright).",
             parameters=[
                 ToolParameter("full_page", "boolean",
                               "Полная страница (true) или видимая область", False),
@@ -1213,7 +2369,7 @@ def register_all_tools() -> int:
         ),
         Tool(
             name="browser_click",
-            description="Кликнуть по элементу на странице (CSS-селектор).",
+            description="Кликнуть по элементу на странице (CSS-селектор, Playwright).",
             parameters=[
                 ToolParameter("selector", "string",
                               "CSS-селектор элемента", True),
@@ -1223,7 +2379,7 @@ def register_all_tools() -> int:
         ),
         Tool(
             name="browser_fill",
-            description="Заполнить поле на веб-странице текстом.",
+            description="Заполнить поле на веб-странице текстом (Playwright).",
             parameters=[
                 ToolParameter("selector", "string", "CSS-селектор поля", True),
                 ToolParameter("value", "string", "Текст для ввода", True),
@@ -1970,6 +3126,554 @@ def register_all_tools() -> int:
             handler=tool_uptime_info,
             category="production",
         ),
+
+        # ─── MESSAGING: WhatsApp, Telegram, Email ───────────────────
+        Tool(
+            name="send_whatsapp",
+            description=(
+                "Отправить сообщение в WhatsApp через Green-API. "
+                "Укажи contact_name (имя контакта из базы) или phone (номер телефона). "
+                "message — текст сообщения."
+            ),
+            parameters=[
+                ToolParameter("contact_name", "string",
+                              "Имя контакта (ищет в БД)", False),
+                ToolParameter("phone", "string",
+                              "Номер телефона (79001234567)", False),
+                ToolParameter("message", "string",
+                              "Текст сообщения", True),
+            ],
+            handler=tool_send_whatsapp,
+            category="messaging",
+            needs_db=True,
+        ),
+        Tool(
+            name="send_telegram",
+            description=(
+                "Отправить личное сообщение в Telegram. "
+                "Можно указать username (@user), contact_name (имя — 'Милана'), "
+                "или chat_id. Имя разрешается автоматически через адресную книгу."
+            ),
+            parameters=[
+                ToolParameter("username", "string",
+                              "Telegram username (напр. @DurdyP)", False),
+                ToolParameter("contact_name", "string",
+                              "Имя контакта (напр. 'Милана', 'Кирилл')", False),
+                ToolParameter("chat_id", "integer",
+                              "Chat ID (числовой)", False),
+                ToolParameter("message", "string",
+                              "Текст сообщения", True),
+            ],
+            handler=tool_send_telegram,
+            category="messaging",
+            needs_db=True,
+        ),
+        Tool(
+            name="read_telegram_chat",
+            description=(
+                "Прочитать историю сообщений Telegram чата. "
+                "Работает по username, chat_id или contact_name (имя). "
+                "Показывает последние сообщения — кто что писал."
+            ),
+            parameters=[
+                ToolParameter("username", "string",
+                              "Telegram username (напр. @milana_sagomonyan)", False),
+                ToolParameter("contact_name", "string",
+                              "Имя контакта (напр. 'Милана')", False),
+                ToolParameter("chat_id", "integer",
+                              "Chat ID (числовой)", False),
+                ToolParameter("limit", "integer",
+                              "Количество сообщений (макс 50)", False, "20"),
+                ToolParameter("days", "integer",
+                              "За сколько дней", False, "30"),
+            ],
+            handler=tool_read_telegram_chat,
+            category="messaging",
+            needs_db=True,
+        ),
+        # ── Contact Book (Smart Name Resolution) ──
+        Tool(
+            name="link_contact",
+            description=(
+                "Привязать контактные данные к имени. "
+                "Используй когда пользователь говорит: 'запомни что у Миланы телеграм @milana', "
+                "'email Кирилла — kirill@mail.ru', 'телефон мамы +79001234567'."
+            ),
+            parameters=[
+                ToolParameter("name", "string",
+                              "Имя контакта (напр. 'Милана', 'Кирилл', 'мама')", True),
+                ToolParameter("telegram", "string",
+                              "Telegram username (напр. @milana_sagomonyan)", False),
+                ToolParameter("phone", "string",
+                              "Номер телефона", False),
+                ToolParameter("email", "string",
+                              "Email адрес", False),
+                ToolParameter("whatsapp", "string",
+                              "WhatsApp номер", False),
+            ],
+            handler=tool_link_contact,
+            category="contacts",
+            needs_db=True,
+        ),
+        Tool(
+            name="resolve_contact",
+            description=(
+                "Найти контакт по имени/нику/прозвищу. "
+                "Поддерживает падежи ('Милане'), уменьшительные ('Серёга'→Сергей), "
+                "ники ('макс'→Максим). Возвращает все привязанные данные."
+            ),
+            parameters=[
+                ToolParameter("name", "string",
+                              "Имя, ник или прозвище контакта", True),
+            ],
+            handler=tool_resolve_contact,
+            category="contacts",
+            needs_db=True,
+        ),
+        Tool(
+            name="list_contacts",
+            description="Показать все контакты из адресной книги с привязанными данными.",
+            parameters=[],
+            handler=tool_list_contacts,
+            category="contacts",
+        ),
+        Tool(
+            name="send_email",
+            description=(
+                "Отправить email через Gmail API. "
+                "Укажи to (email адрес) или contact_name. "
+                "subject — тема, body — текст письма."
+            ),
+            parameters=[
+                ToolParameter("to", "string",
+                              "Email получателя", False),
+                ToolParameter("subject", "string",
+                              "Тема письма", False, ""),
+                ToolParameter("body", "string",
+                              "Текст письма", True),
+                ToolParameter("contact_name", "string",
+                              "Имя контакта из БД (если нет to)", False),
+            ],
+            handler=tool_send_email,
+            category="messaging",
+            needs_db=True,
+        ),
+        Tool(
+            name="get_emails",
+            description=(
+                "Получить непрочитанные письма из Gmail. "
+                "Показывает отправителя, тему, дату, превью."
+            ),
+            parameters=[
+                ToolParameter("account", "string",
+                              "Аккаунт: work/personal/default (пусто = все)", False, ""),
+                ToolParameter("max_results", "number",
+                              "Максимум писем", False, 5),
+            ],
+            handler=tool_get_emails,
+            category="messaging",
+        ),
+
+        # ─── FILES: Создание Excel, Word, PDF ───────────────────────
+        Tool(
+            name="create_file",
+            description=(
+                "Создать файл (Excel, Word, PDF, CSV, TXT, JSON) по описанию. "
+                "DeepSeek определяет структуру и генерирует файл. "
+                "Файл будет отправлен пользователю."
+            ),
+            parameters=[
+                ToolParameter("description", "string",
+                              "Описание файла (что создать)", True),
+                ToolParameter("file_format", "string",
+                              "Формат: xlsx/docx/pdf/csv/txt/json (авто если пусто)", False, ""),
+            ],
+            handler=tool_create_file,
+            category="files",
+        ),
+        Tool(
+            name="create_excel",
+            description=(
+                "Создать Excel таблицу с данными и отправить пользователю. "
+                "Можно указать заголовки и строки, или пустые — будет примерочная."
+            ),
+            parameters=[
+                ToolParameter("title", "string",
+                              "Название таблицы", False, "Таблица"),
+                ToolParameter("headers", "string",
+                              "Заголовки через запятую: Имя,Возраст,Город", False, ""),
+                ToolParameter("rows", "string",
+                              "Строки через ; колонки через , : Анна,28,Москва;Иван,35,Питер", False, ""),
+            ],
+            handler=tool_create_excel,
+            category="files",
+        ),
+
+        # ─── TELEGRAM BOT API: Chat Management ──────────────────────
+        Tool(
+            name="telegram_get_chat_info",
+            description=(
+                "Получить информацию о Telegram чате по chat_id. "
+                "Показывает название, тип, bio, описание."
+            ),
+            parameters=[
+                ToolParameter("chat_id", "number",
+                              "ID чата (числовой)", True),
+            ],
+            handler=tool_telegram_get_chat_info,
+            category="telegram",
+        ),
+        Tool(
+            name="telegram_forward_message",
+            description=(
+                "Переслать сообщение между Telegram чатами. "
+                "Бот должен быть участником обоих чатов."
+            ),
+            parameters=[
+                ToolParameter("from_chat_id", "number",
+                              "ID чата-источника", True),
+                ToolParameter("to_chat_id", "number",
+                              "ID чата-получателя", True),
+                ToolParameter("message_id", "number",
+                              "ID сообщения для пересылки", True),
+            ],
+            handler=tool_telegram_forward_message,
+            category="telegram",
+        ),
+        Tool(
+            name="telegram_pin_message",
+            description=(
+                "Закрепить сообщение в Telegram чате. "
+                "Бот должен быть админом."
+            ),
+            parameters=[
+                ToolParameter("chat_id", "number", "ID чата", True),
+                ToolParameter("message_id", "number",
+                              "ID сообщения для закрепления", True),
+            ],
+            handler=tool_telegram_pin_message,
+            category="telegram",
+        ),
+        Tool(
+            name="telegram_manage_chat",
+            description=(
+                "Управление Telegram чатом/группой через Bot API. "
+                "Действия: info (инфо), set_title, set_description, "
+                "ban/unban пользователя, get_members_count. "
+                "Бот должен быть админом группы."
+            ),
+            parameters=[
+                ToolParameter("action", "string",
+                              "Действие: info/set_title/set_description/ban/unban/get_members_count",
+                              False, "info"),
+                ToolParameter("chat_id", "number", "ID чата/группы", True),
+                ToolParameter("user_id", "number",
+                              "ID пользователя (для ban/unban)", False),
+                ToolParameter("title", "string",
+                              "Новое название (для set_title)", False),
+                ToolParameter("description", "string",
+                              "Описание (для set_description)", False),
+            ],
+            handler=tool_telegram_manage_chat,
+            category="telegram",
+        ),
+        Tool(
+            name="telegram_send_photo",
+            description=(
+                "Отправить фото в Telegram чат. "
+                "Нужен chat_id и путь к файлу."
+            ),
+            parameters=[
+                ToolParameter("chat_id", "number", "ID чата", True),
+                ToolParameter("photo_path", "string",
+                              "Путь к файлу фото", True),
+                ToolParameter("caption", "string",
+                              "Подпись к фото", False, ""),
+            ],
+            handler=tool_telegram_send_photo,
+            category="telegram",
+        ),
+
+        # ─── Sandbox / File Operations (Manus+ level) ──────────────
+        Tool(
+            name="sandbox_read_file",
+            description=(
+                "Прочитать файл (текст, Python, CSV, Excel, PDF). "
+                "Поддержка диапазона строк."
+            ),
+            parameters=[
+                ToolParameter("path", "string", "Путь к файлу", True),
+                ToolParameter("start_line", "number",
+                              "Начальная строка (опц.)", False),
+                ToolParameter("end_line", "number",
+                              "Конечная строка (опц.)", False),
+            ],
+            handler=tool_sandbox_read_file,
+            category="sandbox",
+        ),
+        Tool(
+            name="sandbox_edit_file",
+            description=(
+                "Редактировать файл БЕЗ разрушения архитектуры. "
+                "Точечные замены с бэкапом + валидация Python через AST. "
+                "Edits: [{\"find\": \"old\", \"replace\": \"new\"}, "
+                "{\"line\": 10, \"replace\": \"...\"}, "
+                "{\"insert_after_line\": 5, \"content\": \"...\"}]"
+            ),
+            parameters=[
+                ToolParameter("path", "string", "Путь к файлу", True),
+                ToolParameter("edits", "string",
+                              "JSON массив правок: [{find,replace}, {line,replace}, {insert_after_line,content}]",
+                              True),
+                ToolParameter("create_backup", "boolean",
+                              "Создать бэкап (по умолчанию да)", False, True),
+            ],
+            handler=tool_sandbox_edit_file,
+            category="sandbox",
+        ),
+        Tool(
+            name="sandbox_create_file",
+            description="Создать новый файл с содержимым. Валидация .py через AST.",
+            parameters=[
+                ToolParameter("path", "string", "Путь к файлу", True),
+                ToolParameter("content", "string", "Содержимое файла", True),
+            ],
+            handler=tool_sandbox_create_file,
+            category="sandbox",
+        ),
+        Tool(
+            name="sandbox_run_code",
+            description=(
+                "Выполнить Python код в безопасной песочнице. "
+                "Ограничены опасные модули (subprocess, shutil, ctypes). "
+                "Таймаут 30 сек."
+            ),
+            parameters=[
+                ToolParameter("code", "string",
+                              "Python код для выполнения", True),
+                ToolParameter("timeout", "number",
+                              "Таймаут в секундах", False, 30),
+            ],
+            handler=tool_sandbox_run_code,
+            category="sandbox",
+        ),
+        Tool(
+            name="sandbox_search_files",
+            description="Поиск текста в файлах (grep). Поддержка regex.",
+            parameters=[
+                ToolParameter("pattern", "string", "Что искать", True),
+                ToolParameter("directory", "string",
+                              "Директория поиска", False),
+                ToolParameter("extensions", "string",
+                              "Расширения через запятую: .py,.txt,.csv", False),
+                ToolParameter("regex", "boolean", "Regex поиск", False, False),
+            ],
+            handler=tool_sandbox_search_files,
+            category="sandbox",
+        ),
+        Tool(
+            name="sandbox_list_dir",
+            description="Показать структуру директории (дерево файлов).",
+            parameters=[
+                ToolParameter("path", "string", "Путь к директории", False),
+                ToolParameter("max_depth", "number",
+                              "Глубина (по умолчанию 3)", False, 3),
+            ],
+            handler=tool_sandbox_list_dir,
+            category="sandbox",
+        ),
+        Tool(
+            name="sandbox_csv_read",
+            description="Прочитать CSV/TSV файл с форматированием в таблицу.",
+            parameters=[
+                ToolParameter("path", "string", "Путь к CSV файлу", True),
+                ToolParameter("max_rows", "number",
+                              "Макс. строк для показа", False, 30),
+            ],
+            handler=tool_sandbox_csv_read,
+            category="sandbox",
+        ),
+        Tool(
+            name="sandbox_csv_edit",
+            description=(
+                "Редактировать CSV: add_row, edit_cell, delete_row, add_column, sort. "
+                "Operations: [{\"op\": \"add_row\", \"data\": [\"v1\",\"v2\"]}, "
+                "{\"op\": \"edit_cell\", \"row\": 0, \"col\": 1, \"value\": \"new\"}]"
+            ),
+            parameters=[
+                ToolParameter("path", "string", "Путь к CSV файлу", True),
+                ToolParameter("operations", "string",
+                              "JSON массив операций", True),
+            ],
+            handler=tool_sandbox_csv_edit,
+            category="sandbox",
+        ),
+
+        # ─── Wide Research (UNIQUE — лучше Manus) ──────────────────
+        Tool(
+            name="wide_research",
+            description=(
+                "🔬 Широкое исследование: параллельные суб-агенты, "
+                "детекция противоречий, скоринг уверенности. "
+                "Лучше Manus Wide Research."
+            ),
+            parameters=[
+                ToolParameter("query", "string", "Тема исследования", True),
+                ToolParameter("max_sources", "number",
+                              "Макс. источников на суб-запрос", False, 5),
+            ],
+            handler=tool_wide_research,
+            category="research",
+        ),
+        Tool(
+            name="quick_research",
+            description="Быстрое исследование без LLM — только поиск + анализ.",
+            parameters=[
+                ToolParameter("query", "string", "Запрос", True),
+                ToolParameter("max_sources", "number",
+                              "Макс. источников", False, 3),
+            ],
+            handler=tool_quick_research,
+            category="research",
+        ),
+        Tool(
+            name="compare_research",
+            description=(
+                "🔥 УНИКАЛЬНО: сравнить N объектов по M критериям. "
+                "Параллельное исследование каждого. "
+                "items через запятую, criteria через запятую."
+            ),
+            parameters=[
+                ToolParameter("items", "string",
+                              "Объекты для сравнения через запятую", True),
+                ToolParameter("criteria", "string",
+                              "Критерии через запятую (опц.)", False),
+            ],
+            handler=tool_compare_research,
+            category="research",
+        ),
+
+        # ─── Data Analysis (встроенный движок) ─────────────────────
+        Tool(
+            name="analyze_data",
+            description=(
+                "📊 Полный EDA (Exploratory Data Analysis) файла. "
+                "CSV/Excel/JSON → статистика, корреляции, графики."
+            ),
+            parameters=[
+                ToolParameter("path", "string", "Путь к файлу данных", True),
+                ToolParameter("generate_charts", "boolean",
+                              "Генерировать графики", False, True),
+            ],
+            handler=tool_analyze_data,
+            category="data",
+        ),
+        Tool(
+            name="create_chart",
+            description=(
+                "📈 Создать график (bar, line, pie, scatter) из данных файла."
+            ),
+            parameters=[
+                ToolParameter("path", "string", "Путь к файлу данных", True),
+                ToolParameter("x_column", "string", "Столбец X", True),
+                ToolParameter("y_column", "string", "Столбец Y", True),
+                ToolParameter("chart_type", "string",
+                              "Тип: bar, line, pie, scatter", False, "bar"),
+                ToolParameter("title", "string", "Заголовок графика", False),
+            ],
+            handler=tool_create_chart,
+            category="data",
+        ),
+        Tool(
+            name="data_filter",
+            description=(
+                "🔍 Фильтрация данных по условию: equals, contains, "
+                "greater, less, not_empty, starts_with."
+            ),
+            parameters=[
+                ToolParameter("path", "string", "Путь к файлу данных", True),
+                ToolParameter("column", "string", "Столбец", True),
+                ToolParameter("condition", "string",
+                              "Условие: equals/contains/greater/less/not_empty/starts_with",
+                              True),
+                ToolParameter("value", "string", "Значение", False, ""),
+            ],
+            handler=tool_data_filter,
+            category="data",
+        ),
+        Tool(
+            name="data_group_by",
+            description=(
+                "📊 Группировка данных с агрегацией: count, sum, avg, min, max."
+            ),
+            parameters=[
+                ToolParameter("path", "string", "Путь к файлу данных", True),
+                ToolParameter("group_column", "string",
+                              "Столбец группировки", True),
+                ToolParameter("agg_column", "string",
+                              "Столбец агрегации (опц.)", False),
+                ToolParameter("agg_func", "string",
+                              "Функция: count/sum/avg/min/max", False, "count"),
+            ],
+            handler=tool_data_group_by,
+            category="data",
+        ),
+        Tool(
+            name="data_stats",
+            description="📊 Детальная статистика по столбцу или всем числовым столбцам.",
+            parameters=[
+                ToolParameter("path", "string", "Путь к файлу данных", True),
+                ToolParameter("column", "string", "Столбец (опц.)", False),
+            ],
+            handler=tool_data_stats,
+            category="data",
+        ),
+        # ── v6: Persona & Proactive ──
+        Tool(
+            name="persona_stats",
+            description="🧠 Статистика персоны: сколько пользователей изучено, группы сходства.",
+            parameters=[],
+            handler=tool_persona_stats,
+            category="persona",
+        ),
+        Tool(
+            name="persona_retrain",
+            description="🔄 Принудительный retrain персоны из истории чатов.",
+            parameters=[
+                ToolParameter("days", "integer",
+                              "За сколько дней перечитать историю", False, "3"),
+            ],
+            handler=tool_persona_retrain,
+            category="persona",
+        ),
+        Tool(
+            name="persona_style",
+            description="📋 Показать стиль-гайд пользователя (как он общается).",
+            parameters=[
+                ToolParameter("chat_id", "integer",
+                              "Chat ID пользователя (0 = владелец)", False, "0"),
+            ],
+            handler=tool_persona_style,
+            category="persona",
+        ),
+        Tool(
+            name="proactive_status",
+            description="⚡ Статус проактивного движка: задачи, аномалии, фильтры.",
+            parameters=[],
+            handler=tool_proactive_status,
+            category="proactive",
+        ),
+        Tool(
+            name="add_important_keyword",
+            description="🔑 Добавить ключевое слово для проактивного мониторинга сообщений.",
+            parameters=[
+                ToolParameter("keyword", "string", "Ключевое слово", True),
+                ToolParameter("weight", "number",
+                              "Вес важности (0-2)", False, "1.0"),
+            ],
+            handler=tool_add_important_keyword,
+            category="proactive",
+        ),
     ]
 
     for tool in tools:
@@ -2121,11 +3825,12 @@ async def tool_autonomous_task(
         priority_map = {
             "critical": TaskPriority.CRITICAL,
             "high": TaskPriority.HIGH,
-            "normal": TaskPriority.NORMAL,
+            "normal": TaskPriority.MEDIUM,
+            "medium": TaskPriority.MEDIUM,
             "low": TaskPriority.LOW,
             "background": TaskPriority.BACKGROUND,
         }
-        p = priority_map.get(priority.lower(), TaskPriority.NORMAL)
+        p = priority_map.get(priority.lower(), TaskPriority.MEDIUM)
 
         # Дедлайн
         from datetime import datetime, timedelta
@@ -2134,16 +3839,18 @@ async def tool_autonomous_task(
             deadline = datetime.utcnow() + timedelta(hours=float(deadline_hours))
 
         task = autonomy_engine.create_task(
-            goal=goal,
-            user_id=kwargs.get("_user_id", "system"),
+            title=goal,
+            description=goal,
             priority=p,
             deadline=deadline,
+            owner_id=kwargs.get("_user_id", 0),
+            chat_id=kwargs.get("_chat_id", 0),
         )
 
         lines = [
             "🤖 Автономная задача создана:",
             f"  🆔 ID: {task.id}",
-            f"  🎯 Цель: {task.goal}",
+            f"  🎯 Цель: {task.title}",
             f"  ⚡ Приоритет: {priority}",
         ]
         if deadline:
@@ -2174,7 +3881,7 @@ async def tool_task_status(task_id: str = "", **kwargs) -> ToolResult:
                 )
             lines = [
                 f"📋 Задача {task.id}:",
-                f"  🎯 {task.goal}",
+                f"  🎯 {task.title}",
                 f"  📊 Статус: {task.status.value}",
                 f"  📈 Прогресс: {task.progress:.0%}",
                 f"  🔧 Шагов: {len(task.steps)}",
@@ -2730,21 +4437,28 @@ async def tool_create_template(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BROWSER TOOLS (handlers)
+# BROWSER TOOLS (handlers) — Manus-level browsing
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def tool_web_search(query: str, max_results: int = 10, **kwargs) -> ToolResult:
-    """Поиск в интернете через Browser Engine."""
-    from pds_ultimate.core.browser_engine import browser_engine
+    """
+    Поиск в интернете — Manus-level.
+    Primary: HttpxBrowser (всегда работает)
+    Fallback: Playwright BrowserEngine (если установлен)
+    """
+    max_results = min(int(max_results), 20)
+
+    from pds_ultimate.core.httpx_browser import httpx_browser
 
     try:
-        results = await browser_engine.web_search(
-            query, max_results=min(int(max_results), 20)
-        )
+        results = await httpx_browser.search(query, max_results=max_results)
+
         if not results:
-            return ToolResult("web_search", True,
-                              f"По запросу «{query}» ничего не найдено.",
-                              data={"results": []})
+            return ToolResult(
+                "web_search", True,
+                f"По запросу «{query}» ничего не найдено.",
+                data={"results": []},
+            )
 
         lines = [f"🔍 Результаты поиска: «{query}» ({len(results)} шт.)\n"]
         for r in results:
@@ -2761,46 +4475,227 @@ async def tool_web_search(query: str, max_results: int = 10, **kwargs) -> ToolRe
                 for r in results
             ]},
         )
-
     except Exception as e:
         return ToolResult("web_search", False, "",
                           error=f"Ошибка поиска: {e}")
 
 
 async def tool_open_page(url: str, **kwargs) -> ToolResult:
-    """Открыть страницу и извлечь данные."""
-    from pds_ultimate.core.browser_engine import browser_engine
+    """
+    Открыть страницу и извлечь данные — Manus-level.
+    Primary: HttpxBrowser (всегда)
+    Fallback: Playwright BrowserEngine
+    """
+    from pds_ultimate.core.httpx_browser import httpx_browser
 
     try:
-        data = await browser_engine.extract_data(url)
+        page = await httpx_browser.open_page(url)
 
-        if not data.text and not data.title:
+        if not page.success:
             return ToolResult("open_page", False, "",
-                              error=f"Не удалось загрузить: {url}")
+                              error=f"Не удалось загрузить: {url} ({page.error})")
 
-        # Обрезаем текст до разумного размера для LLM
-        text = data.text[:4000] if data.text else ""
-        if len(data.text) > 4000:
-            text += f"\n\n... (ещё {len(data.text) - 4000} символов)"
+        text = page.text[:4000] if page.text else ""
+        extra = ""
+        if page.text and len(page.text) > 4000:
+            extra = f"\n\n... (ещё {len(page.text) - 4000} символов)"
 
-        lines = [f"📄 {data.title}", f"🔗 {data.url}", ""]
+        lines = [f"📄 {page.title}", f"🔗 {page.url}"]
+        if page.headings:
+            lines.append(f"📑 Заголовков: {len(page.headings)}")
+        if page.tables:
+            lines.append(f"📊 Таблиц: {len(page.tables)}")
+        if page.links:
+            lines.append(f"🔗 Ссылок: {len(page.links)}")
+        lines.append(f"⏱ {page.load_time_ms}ms")
+        lines.append("")
         if text:
-            lines.append(text)
-
-        if data.tables:
-            lines.append(f"\n📊 Найдено таблиц: {len(data.tables)}")
-            # Показываем первую таблицу
-            for row in data.tables[0][:10]:
-                lines.append("  | " + " | ".join(row[:5]) + " |")
+            lines.append(text + extra)
 
         return ToolResult(
             "open_page", True, "\n".join(lines),
-            data=data.to_dict(),
+            data={
+                "title": page.title,
+                "url": page.url,
+                "text_len": len(page.text or ""),
+                "tables": page.tables[:3],
+                "headings": page.headings[:10],
+                "links_count": len(page.links),
+            },
         )
-
     except Exception as e:
         return ToolResult("open_page", False, "",
                           error=f"Ошибка загрузки страницы: {e}")
+
+
+async def tool_search_and_read(
+    query: str,
+    max_pages: int = 3,
+    **kwargs,
+) -> ToolResult:
+    """
+    Manus-level: Поиск + автоматическое чтение топ-N страниц.
+    Одним вызовом: ищет → открывает → извлекает → возвращает.
+    """
+    max_pages = min(int(max_pages), 5)
+
+    from pds_ultimate.core.httpx_browser import httpx_browser
+
+    try:
+        pages = await httpx_browser.search_and_extract(
+            query, max_pages=max_pages, max_text_per_page=2500
+        )
+
+        if not pages:
+            return ToolResult(
+                "search_and_read", True,
+                f"По запросу «{query}» не удалось получить контент со страниц.",
+                data={"pages": []},
+            )
+
+        lines = [f"🔍📖 Поиск + чтение: «{query}» ({len(pages)} источников)\n"]
+
+        for i, page in enumerate(pages, 1):
+            lines.append(f"━━━ Источник {i}: {page.title} ━━━")
+            lines.append(f"🔗 {page.url}")
+            if page.text:
+                lines.append(page.text[:2500])
+            if page.tables:
+                lines.append(f"\n📊 Таблиц: {len(page.tables)}")
+                for tbl in page.tables[:2]:
+                    for row in tbl[:5]:
+                        lines.append("  | " + " | ".join(row))
+            lines.append("")
+
+        stats = httpx_browser.get_session_stats()
+        lines.append(
+            f"\n📊 Статистика: {stats['total_requests']} запросов, "
+            f"{stats['total_bytes'] // 1024}KB, {stats['duration_ms']}ms"
+        )
+
+        return ToolResult(
+            "search_and_read", True, "\n".join(lines),
+            data={
+                "pages": [
+                    {"url": p.url, "title": p.title,
+                     "text_len": len(p.text or "")}
+                    for p in pages
+                ],
+            },
+        )
+    except Exception as e:
+        return ToolResult("search_and_read", False, "",
+                          error=f"Ошибка поиска и чтения: {e}")
+
+
+async def tool_deep_web_research(
+    query: str,
+    max_sources: int = 5,
+    **kwargs,
+) -> ToolResult:
+    """
+    Manus-level глубокое исследование:
+    Поиск → чтение страниц → переход по ссылкам → сбор всех данных.
+    """
+    max_sources = min(int(max_sources), 10)
+
+    from pds_ultimate.core.httpx_browser import httpx_browser
+
+    try:
+        result = await httpx_browser.deep_search(
+            query,
+            max_sources=max_sources,
+            follow_depth=1,
+            max_text_per_page=2000,
+        )
+
+        findings = result.get("findings", [])
+        if not findings:
+            return ToolResult(
+                "deep_web_research", True,
+                f"По теме «{query}» не удалось собрать данные.",
+                data=result,
+            )
+
+        lines = [
+            f"🔬 Глубокое исследование: «{query}»",
+            f"📖 Источников: {result['sources_count']}",
+            f"📄 Страниц обработано: {result['pages_fetched']}",
+            f"⏱ {result['duration_ms']}ms\n",
+        ]
+
+        for i, f in enumerate(findings, 1):
+            lines.append(f"━━━ [{i}] {f['title']} ━━━")
+            lines.append(f"🔗 {f['url']}")
+            lines.append(f['text'][:2000])
+            if f.get('tables'):
+                lines.append(f"📊 Таблиц: {len(f['tables'])}")
+            lines.append("")
+
+        return ToolResult(
+            "deep_web_research", True, "\n".join(lines),
+            data=result,
+        )
+    except Exception as e:
+        return ToolResult("deep_web_research", False, "",
+                          error=f"Ошибка глубокого исследования: {e}")
+
+
+async def tool_extract_page_data(
+    url: str,
+    focus: str = "",
+    **kwargs,
+) -> ToolResult:
+    """Извлечь структурированные данные со страницы."""
+    from pds_ultimate.core.httpx_browser import httpx_browser
+
+    try:
+        result = await httpx_browser.extract_structured(url, focus=focus)
+
+        if result.get("error"):
+            return ToolResult("extract_page_data", False, "",
+                              error=result["error"])
+
+        lines = [f"📄 {result.get('title', url)}"]
+        lines.append(f"🔗 {url}")
+
+        if result.get("meta"):
+            desc = result["meta"].get("description", "")
+            if desc:
+                lines.append(f"📝 {desc[:200]}")
+
+        if result.get("headings"):
+            lines.append("\n📑 Заголовки:")
+            for h in result["headings"][:15]:
+                indent = "  " * int(h["level"][1])
+                lines.append(f"{indent}• {h['text']}")
+
+        if result.get("focused_text"):
+            lines.append(f"\n🎯 Текст по теме «{focus}»:")
+            lines.append(result["focused_text"][:3000])
+        elif result.get("text"):
+            lines.append("\n📄 Текст:")
+            lines.append(result["text"][:3000])
+
+        if result.get("tables"):
+            lines.append(f"\n📊 Таблицы ({result['tables_count']}):")
+            for tbl in result["tables"][:3]:
+                for row in tbl[:8]:
+                    lines.append("  | " + " | ".join(str(c) for c in row))
+                lines.append("  ---")
+
+        lines.append(
+            f"\n📊 Ссылок: {result.get('links_count', 0)}, "
+            f"Изображений: {result.get('images_count', 0)}"
+        )
+
+        return ToolResult(
+            "extract_page_data", True, "\n".join(lines),
+            data=result,
+        )
+    except Exception as e:
+        return ToolResult("extract_page_data", False, "",
+                          error=f"Ошибка извлечения данных: {e}")
 
 
 async def tool_browser_screenshot(full_page: bool = False, **kwargs) -> ToolResult:
@@ -3831,3 +5726,97 @@ async def tool_uptime_info(**kwargs) -> ToolResult:
             "uptime_info", False, "",
             error=f"Ошибка аптайм info: {e}",
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PART v6: PERSONA & PROACTIVE TOOLS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def tool_persona_stats(**kwargs) -> ToolResult:
+    """Статистика персоны: сколько пользователей изучено, группы сходства."""
+    try:
+        from pds_ultimate.core.persona_engine import persona_engine
+
+        stats = persona_engine.get_stats()
+        lines = [
+            "🧠 Persona Engine:",
+            f"  👥 Пользователей изучено: {stats['users']}",
+            f"  🔗 Групп сходства: {stats['shared_groups']}",
+            f"  📅 Последний retrain: {stats['last_retrain_at']}",
+        ]
+        return ToolResult("persona_stats", True, "\n".join(lines), data=stats)
+    except Exception as e:
+        return ToolResult("persona_stats", False, "", error=str(e))
+
+
+async def tool_persona_retrain(days: int = 3, **kwargs) -> ToolResult:
+    """Принудительный retrain персоны из истории чатов."""
+    try:
+        from pds_ultimate.core.persona_engine import persona_engine
+
+        # Reset interval to force retrain
+        persona_engine._last_retrain_at = 0
+        result = persona_engine.run_periodic_retrain(days=days)
+        if result.get("retrained"):
+            return ToolResult(
+                "persona_retrain", True,
+                f"✅ Retrain завершён: обработано {result['processed']} сообщений.",
+                data=result,
+            )
+        return ToolResult(
+            "persona_retrain", False,
+            f"⚠️ Retrain не выполнен: {result.get('reason', 'unknown')}",
+        )
+    except Exception as e:
+        return ToolResult("persona_retrain", False, "", error=str(e))
+
+
+async def tool_persona_style(chat_id: int = 0, **kwargs) -> ToolResult:
+    """Показать стиль-гайд для конкретного пользователя."""
+    try:
+        from pds_ultimate.config import config
+        from pds_ultimate.core.persona_engine import persona_engine
+
+        cid = chat_id or config.telegram.owner_id
+        guide = persona_engine.get_style_guide(cid)
+        if guide:
+            return ToolResult("persona_style", True, guide)
+        return ToolResult(
+            "persona_style", True,
+            "📋 Недостаточно данных для стиль-гайда (нужно > 6 сообщений).",
+        )
+    except Exception as e:
+        return ToolResult("persona_style", False, "", error=str(e))
+
+
+async def tool_proactive_status(**kwargs) -> ToolResult:
+    """Статус проактивного движка: задачи, аномалии, фильтры."""
+    try:
+        from pds_ultimate.core.proactive_engine import proactive_engine
+
+        stats = proactive_engine.get_stats()
+        lines = [
+            "⚡ Proactive Engine:",
+            f"  ✅ Запущен: {stats.get('running', False)}",
+            f"  📋 Задач в очереди: {stats.get('pending_tasks', 0)}",
+            f"  📊 Важных ключевых слов: {stats.get('important_keywords', 0)}",
+            f"  🔔 Событий за сессию: {stats.get('events_logged', 0)}",
+        ]
+        return ToolResult("proactive_status", True, "\n".join(lines), data=stats)
+    except Exception as e:
+        return ToolResult("proactive_status", False, "", error=str(e))
+
+
+async def tool_add_important_keyword(keyword: str, weight: float = 1.0, **kwargs) -> ToolResult:
+    """Добавить ключевое слово для проактивного мониторинга сообщений."""
+    try:
+        from pds_ultimate.core.proactive_engine import proactive_engine
+
+        proactive_engine.add_important_keyword(keyword)
+        return ToolResult(
+            "add_important_keyword", True,
+            f"✅ Ключевое слово '{keyword}' добавлено (вес: {weight}).",
+        )
+    except Exception as e:
+        return ToolResult("add_important_keyword", False, "", error=str(e))

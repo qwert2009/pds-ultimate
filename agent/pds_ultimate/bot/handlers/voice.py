@@ -77,8 +77,10 @@ async def handle_voice(message: Message, db_session: Session) -> None:
         )
 
         # ─── 3. Обрабатываем как текстовое сообщение ─────────────────
-        message.text = text
-        await handle_text(message, db_session)
+        # aiogram Message — frozen Pydantic model, нельзя менять .text
+        # Создаём копию с текстом из голосового
+        text_message = message.model_copy(update={"text": text})
+        await handle_text(text_message, db_session)
 
     except FileNotFoundError:
         logger.error("ffmpeg не найден. Установите: apt install ffmpeg")
@@ -137,8 +139,8 @@ async def handle_video_note(message: Message, db_session: Session) -> None:
             f"[видео-кружок {message.video_note.length}]: {text}",
         )
 
-        message.text = text
-        await handle_text(message, db_session)
+        text_message = message.model_copy(update={"text": text})
+        await handle_text(text_message, db_session)
 
     except Exception as e:
         logger.error(f"Ошибка обработки видео-кружка: {e}", exc_info=True)

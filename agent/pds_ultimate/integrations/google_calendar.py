@@ -200,10 +200,12 @@ class GoogleCalendarService:
                 if creds and creds.expired and creds.refresh_token:
                     creds.refresh(Request())
                 else:
-                    flow = InstalledAppFlow.from_client_secrets_file(
-                        str(self._credentials_path), self.SCOPES
+                    # НЕ запускаем run_local_server — он блокирует навсегда.
+                    raise RuntimeError(
+                        f"Google Calendar токен не найден: {token_path}. "
+                        f"Запустите OAuth вручную: "
+                        f"python -m pds_ultimate.integrations.gmail_auth"
                     )
-                    creds = flow.run_local_server(port=0)
 
                 # Сохраняем
                 with open(token_path, "wb") as f:

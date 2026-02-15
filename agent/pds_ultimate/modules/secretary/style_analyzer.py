@@ -183,20 +183,19 @@ class StyleAnalyzer:
     # ═══════════════════════════════════════════════════════════════════════
 
     async def _scan_telegram(self) -> list[str]:
-        """Сканирование исходящих сообщений из Telegram чатов."""
+        """Сканирование исходящих сообщений из Telegram чатов через общий Telethon клиент."""
         messages: list[str] = []
 
         try:
-            from telethon import TelegramClient
             from telethon.tl.types import User
 
-            client = TelegramClient(
-                str(config.telethon.session_name),
-                config.telethon.api_id,
-                config.telethon.api_hash,
-            )
+            from pds_ultimate.integrations.telethon_client import telethon_client
 
-            await client.start()
+            if not telethon_client._started or not telethon_client._client:
+                logger.warning("Telethon не запущен — TG анализ пропущен")
+                return messages
+
+            client = telethon_client._client
 
             # Получаем последние активные диалоги
             dialogs = await client.get_dialogs(
@@ -225,8 +224,6 @@ class StyleAnalyzer:
                 logger.debug(
                     f"    Чат '{dialog.name}': {len(chat_messages)} сообщений"
                 )
-
-            await client.disconnect()
 
         except ImportError:
             logger.warning("Telethon не установлен — TG анализ пропущен")

@@ -34,7 +34,6 @@ class GmailAccount:
         """Построить Gmail service (синхронно)."""
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
-        from google_auth_oauthlib.flow import InstalledAppFlow
         from googleapiclient.discovery import build
 
         SCOPES = [
@@ -58,10 +57,13 @@ class GmailAccount:
                         f"Gmail credentials не найден: "
                         f"{self.credentials_file}"
                     )
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    str(self.credentials_file), SCOPES,
+                # НЕ запускаем run_local_server — он блокирует навсегда.
+                # Вместо этого — ошибка, пусть пользователь запустит OAuth отдельно.
+                raise RuntimeError(
+                    f"Gmail токен не найден: {self.token_file}. "
+                    f"Запустите OAuth вручную: "
+                    f"python -m pds_ultimate.integrations.gmail_auth"
                 )
-                creds = flow.run_local_server(port=0)
 
             self.token_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self.token_file, "w") as f:
@@ -103,6 +105,8 @@ class GmailClient:
         import asyncio
         loop = asyncio.get_event_loop()
 
+        GMAIL_TIMEOUT = 10  # секунд на подключение (без браузера)
+
         creds_dir = BASE_DIR / "credentials"
 
         # Рабочий аккаунт
@@ -114,11 +118,16 @@ class GmailClient:
                     credentials_file=work_creds,
                     token_file=DATA_DIR / "gmail_token_work.json",
                 )
-                await loop.run_in_executor(None, account.build_service)
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, account.build_service),
+                    timeout=GMAIL_TIMEOUT,
+                )
                 self._accounts["work"] = account
                 logger.info("Gmail WORK аккаунт подключён ✅")
+            except asyncio.TimeoutError:
+                logger.warning("  ⚠ Gmail WORK: таймаут подключения")
             except Exception as e:
-                logger.error(f"Ошибка подключения Gmail WORK: {e}")
+                logger.warning(f"  ⚠ Gmail WORK: {e}")
 
         # Личный аккаунт
         personal_creds = creds_dir / "gmail_personal.json"
@@ -129,11 +138,16 @@ class GmailClient:
                     credentials_file=personal_creds,
                     token_file=DATA_DIR / "gmail_token_personal.json",
                 )
-                await loop.run_in_executor(None, account.build_service)
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, account.build_service),
+                    timeout=GMAIL_TIMEOUT,
+                )
                 self._accounts["personal"] = account
                 logger.info("Gmail PERSONAL аккаунт подключён ✅")
+            except asyncio.TimeoutError:
+                logger.warning("  ⚠ Gmail PERSONAL: таймаут подключения")
             except Exception as e:
-                logger.error(f"Ошибка подключения Gmail PERSONAL: {e}")
+                logger.warning(f"  ⚠ Gmail PERSONAL: {e}")
 
         # Fallback: gmail.json (единый файл)
         if not self._accounts:
@@ -145,11 +159,16 @@ class GmailClient:
                         credentials_file=fallback_creds,
                         token_file=DATA_DIR / "gmail_token.json",
                     )
-                    await loop.run_in_executor(None, account.build_service)
+                    await asyncio.wait_for(
+                        loop.run_in_executor(None, account.build_service),
+                        timeout=GMAIL_TIMEOUT,
+                    )
                     self._accounts["default"] = account
                     logger.info("Gmail DEFAULT аккаунт подключён ✅")
+                except asyncio.TimeoutError:
+                    logger.warning("  ⚠ Gmail DEFAULT: таймаут подключения")
                 except Exception as e:
-                    logger.error(f"Ошибка подключения Gmail: {e}")
+                    logger.warning(f"  ⚠ Gmail: {e}")
 
         if self._accounts:
             self._started = True
